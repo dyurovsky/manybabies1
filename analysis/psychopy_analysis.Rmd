@@ -1,0 +1,194 @@
+---
+title: Pilot data for CaLLab implementation of manybabies1 
+author: Dan Yurovsky 
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: false
+    number_sections: false
+    theme: lumen
+    toc_float: false
+    code_folding: hide
+---
+
+```{r setup, include = FALSE}
+# load packages
+library(knitr)
+library(data.table)
+library(tidyverse)
+library(rhdf5)
+library(stringr)
+library(DT)
+
+opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, 
+               error = FALSE, cache = FALSE, tidy = FALSE)
+
+theme_dy <- function(base_size = 14) 
+{
+  theme_bw() +   
+  ggplot2::`%+replace%`(ggplot2::theme_bw(base_size = base_size),
+                          ggplot2::theme(panel.grid = ggplot2::element_blank(), 
+        legend.position = "none"))
+}
+
+theme_set(theme_dy())
+```
+
+```{r}
+et_files <- paste("data/", list.files("data/", "*.hdf5"), sep = "")
+log_files <- list.files("data/", "*.log", full.names = TRUE)
+trial_files <- list.files("data/", "*.csv", full.names = TRUE)
+
+get_end_times <- function(log_file) {
+  data_frame(text = read_lines(log_file)) %>%
+    filter(str_detect(text, "autoDraw = False")) %>%
+    filter(str_detect(text, "checkerboard") | str_detect(text, "attention_getter")) %>%
+    separate(text, c("End", "EXP", "message"), sep = "\t") %>%
+    mutate(type = if_else(str_detect(message, "attention_getter"), 
+                          "Attention", "Trial")) %>%
+    select(End, type) %>%
+    mutate(trial = rep(1:(n()/2), each = 2),
+           End = as.numeric(End))
+}
+
+get_trial_data <- function(trial_file) {
+  read_csv(trial_file) %>%
+    select(Stimulus, trials.thisTrialN, attention_key.keys, trial_key.keys) %>%
+    rename(trial = trials.thisTrialN, 
+           Attention = attention_key.keys, 
+           Trial = trial_key.keys) %>%
+    mutate(trial = trial + 1) %>%
+    gather(type, key, Attention, Trial) %>%
+    mutate(speechType = if_else(str_detect(Stimulus, "training"), "training",
+                                if_else(str_detect(Stimulus, "ADS"), "ADS", "IDS"))) %>%
+    mutate(stimNum = as.numeric(if_else(str_detect(Stimulus, "training"),
+                                        as.character(trial),
+                                        str_extract(Stimulus, "[0-9]+"))))
+      
+}
+
+get_event_data <- function(et_file) {
+  
+  h5read(et_file, "data_collection/events/experiment/MessageEvent") %>%
+    as_data_frame() %>%
+    select(time, text) %>%
+    separate(text, c("stimulus", "type"), "_") %>%
+    rename(type = stimulus, event = type) %>%
+    mutate(trial = rleid(type)) %>%
+    spread(event, time) %>%
+    group_by(type) %>%
+    mutate(trial = 1:n()) 
+}
+
+# 
+# order_data <- read_csv("order1.csv") %>%
+#   mutate(trial = 1:nrow(.)) %>%
+#   rename(item = Stimulus) %>%
+#   mutate(type = if_else(item == "training", "training", 
+#                         if_else(str_detect(item, "IDS"), "IDS", "ADS")))
+
+read_data <- function(et_file, trial_file, log_file) {
+  
+  end_times <- get_end_times(log_file)
+  trial_data <- get_trial_data(trial_file)
+  event_data <- get_event_data(et_file)
+  
+  order_data <- filter(event_data, is.na(End)) %>%
+    select(-End) %>%
+    left_join(end_times, by = c("type", "trial")) %>%
+    bind_rows(filter(event_data, !is.na(End))) %>%
+    left_join(trial_data, by = c("type", "trial")) %>%
+    arrange(trial, type)
+  
+  data <- h5read(et_file, "data_collection/events/eyetracker/BinocularEyeSampleEvent") %>%
+    as_data_frame()
+  
+  filter_data <- data %>%
+    select(time, status,left_gaze_x, left_gaze_y, left_eye_cam_x, 
+           left_eye_cam_y,
+           right_gaze_x, right_gaze_y, right_eye_cam_x, 
+          right_eye_cam_y)
+  
+  
+  tag_data <- function(row) {
+    filter_data %>%
+      filter(time >= row$Start & time < row$End) %>%
+      mutate(type = row$type, 
+             trial = row$trial)
+  }
+  
+  
+  map(seq(1,nrow(order_data)), 
+         function(x) tag_data(order_data[x,])) %>%
+    bind_rows() %>%
+    mutate(right_gaze_x = if_else(status == 2 | status == 22,
+                                  as.numeric(NA), right_gaze_x),
+           right_gaze_y = if_else(status == 2 | status == 22,
+                                  as.numeric(NA), right_gaze_y),
+           left_gaze_x = if_else(status == 20 | status == 22,
+                                 as.numeric(NA), left_gaze_x),
+           left_gaze_y = if_else(status == 20 | status == 22,
+                                 as.numeric(NA), left_gaze_y)) %>%
+    group_by(trial, type) %>%
+    mutate(time = time - min(time)) %>%
+    mutate(subj = str_split(et_file, "/")[[1]][2]) %>%
+    left_join(order_data, by = c("type", "trial"))
+}
+
+gaze_data <- pmap(list(et_files, trial_files, log_files), read_data) %>%
+  bind_rows()
+
+durations <- gaze_data %>%
+  group_by(subj, type, speechType, trial) %>%
+  summarise(duration = max(time))
+
+datatable(durations, rownames = FALSE)
+
+sem <- function (x, na.rm = FALSE) 
+{
+    if (na.rm) {
+        n <- sum(!is.na(x))
+    }
+    else {
+        n <- length(x)
+    }
+    stats::sd(x, na.rm = na.rm)/sqrt(n)
+}
+
+durations %>%
+  filter(type == "Trial") %>%
+  group_by(speechType, subj, trial) %>%
+  summarise(duration = mean(duration)) %>%
+  summarise(duration = mean(duration)) %>%
+  spread(speechType, duration) %>%
+  mutate(diff = IDS - ADS) %>%
+  summarise_at(vars(diff), funs(mean, sem), na.rm = T) %>%
+  datatable(rownames = FALSE)
+
+
+```
+
+```{r plots, fig.width = 5, fig.height = 12}
+make_plots <- function(gaze_data) {
+  
+  print(paste0("Subj: ", gaze_data[1,"subj"]))
+  
+  p1 <- ggplot(gaze_data, aes(x = time)) +
+    facet_grid(trial ~ type, scales = "free") +
+    geom_point(aes(y = left_gaze_x), color = "red", size = .1, alpha = .5) +
+    geom_point(aes(y = right_gaze_x), color = "blue", size = .1, alpha = .5) +
+    ylab("X Points")
+  print(p1)
+  
+  p2 <- ggplot(gaze_data, aes(x = time)) +
+    facet_grid(trial ~ type, scales = "free") +
+    geom_point(aes(y = left_gaze_y), color = "red", size = .1, alpha = .5) +
+    geom_point(aes(y = right_gaze_y), color = "blue", size = .1, alpha = .5) +
+    ylab("Y Points")
+  print(p2)
+}
+
+gaze_data %>%
+  split(.$subj) %>%
+  walk(., make_plots)
+```
