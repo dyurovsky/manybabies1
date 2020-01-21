@@ -16,8 +16,10 @@ output:
 library(knitr)
 library(data.table)
 library(tidyverse)
+#http://bioconductor.org/packages/release/bioc/html/rhdf5.html
 library(rhdf5)
 library(stringr)
+library(here)
 library(DT)
 
 opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, 
@@ -34,21 +36,47 @@ theme_dy <- function(base_size = 14)
 theme_set(theme_dy())
 ```
 
-```{r}
-et_files <- paste("data/", list.files("data/", "*.hdf5"), sep = "")
-log_files <- list.files("data/", "*.log", full.names = TRUE)
-trial_files <- list.files("data/", "*.csv", full.names = TRUE)
+```{r data-files}
+et_files_younger <- list.files(here("data/younger"), "*.hdf5", 
+                               full.names = TRUE)
+log_files_younger <- list.files(here("data/younger"), "*.log", 
+                                full.names = TRUE)
+trial_files_younger <- list.files(here("data/younger"), "*.csv", 
+                                  full.names = TRUE)
 
+
+et_files_older <- list.files(here("data/older"), "*.hdf5", 
+                             full.names = TRUE)
+
+log_files_older <- list.files(here("data/older"), "*.log", 
+                                full.names = TRUE) %>%
+  enframe(name = NULL) %>%
+  filter(!str_detect(value, "33") & !str_detect(value, "38") ) %>%
+  pull(value)
+
+trial_files_older <- list.files(here("data/older"), "*.csv", 
+                                  full.names = TRUE) %>%
+  enframe(name = NULL) %>%
+  filter(!str_detect(value, "33") & !str_detect(value, "38") ) %>%
+  pull(value)
+```
+
+```{r loading-helpers}
 get_end_times <- function(log_file) {
-  data_frame(text = read_lines(log_file)) %>%
+ end_times <- data_frame(text = read_lines(log_file)) %>%
     filter(str_detect(text, "autoDraw = False")) %>%
     filter(str_detect(text, "checkerboard") | str_detect(text, "attention_getter")) %>%
     separate(text, c("End", "EXP", "message"), sep = "\t") %>%
     mutate(type = if_else(str_detect(message, "attention_getter"), 
                           "Attention", "Trial")) %>%
-    select(End, type) %>%
-    mutate(trial = rep(1:(n()/2), each = 2),
-           End = as.numeric(End))
+    select(End, type) 
+ 
+ if(nrow(end_times) > 0)
+  end_times %>%
+     mutate(trial = rep(1:(n()/2), each = 2),
+            End = as.numeric(End))
+ else
+   end_times
 }
 
 get_trial_data <- function(trial_file) {
@@ -75,9 +103,10 @@ get_event_data <- function(et_file) {
     separate(text, c("stimulus", "type"), "_") %>%
     rename(type = stimulus, event = type) %>%
     mutate(trial = rleid(type)) %>%
+    distinct(event, type, trial, .keep_all = T) %>%
     spread(event, time) %>%
     group_by(type) %>%
-    mutate(trial = 1:n()) 
+    mutate(trial = 1:n())
 }
 
 # 
@@ -89,16 +118,24 @@ get_event_data <- function(et_file) {
 
 read_data <- function(et_file, trial_file, log_file) {
   
+  print(et_file)
+  
   end_times <- get_end_times(log_file)
   trial_data <- get_trial_data(trial_file)
   event_data <- get_event_data(et_file)
   
-  order_data <- filter(event_data, is.na(End)) %>%
-    select(-End) %>%
-    left_join(end_times, by = c("type", "trial")) %>%
-    bind_rows(filter(event_data, !is.na(End))) %>%
-    left_join(trial_data, by = c("type", "trial")) %>%
-    arrange(trial, type)
+  if(nrow(end_times) > 0) {
+    order_data <- filter(event_data, is.na(End)) %>%
+        select(-End) %>%
+        left_join(end_times, by = c("type", "trial")) %>%
+        bind_rows(filter(event_data, !is.na(End))) %>%
+        left_join(trial_data, by = c("type", "trial")) %>%
+        arrange(trial, type)
+  } else {
+     order_data <- event_data %>%
+        left_join(trial_data, by = c("type", "trial")) %>%
+        arrange(trial, type)
+  }
   
   data <- h5read(et_file, "data_collection/events/eyetracker/BinocularEyeSampleEvent") %>%
     as_data_frame()
@@ -131,13 +168,29 @@ read_data <- function(et_file, trial_file, log_file) {
                                  as.numeric(NA), left_gaze_y)) %>%
     group_by(trial, type) %>%
     mutate(time = time - min(time)) %>%
-    mutate(subj = str_split(et_file, "/")[[1]][2]) %>%
+    mutate(subj = str_split(et_file, "/")[[1]][3]) %>%
     left_join(order_data, by = c("type", "trial"))
 }
+```
 
-gaze_data <- pmap(list(et_files, trial_files, log_files), read_data) %>%
-  bind_rows()
+```{r load-data, message = F, warning = FALSE}
+gaze_data_younger <- pmap(list(et_files_younger, trial_files_younger, 
+                               log_files_younger), read_data) %>%
+  bind_rows() %>%
+  mutate(group = "younger")
 
+gaze_data_older <- pmap(list(et_files_older, trial_files_older, 
+                               log_files_older), read_data) %>%
+  bind_rows() %>%
+  mutate(group = "older")
+
+
+gaze_data <- bind_rows(gaze_data_younger, gaze_data_older)
+
+write_csv(gaze_data, here("processed_data/callab_manybabies_et.csv"))
+```
+
+```{r process-data, eval = F, include = F}
 durations <- gaze_data %>%
   group_by(subj, type, speechType, trial) %>%
   summarise(duration = max(time))
@@ -155,20 +208,60 @@ sem <- function (x, na.rm = FALSE)
     stats::sd(x, na.rm = na.rm)/sqrt(n)
 }
 
-durations %>%
+subjs <- gaze_data %>%
+  ungroup() %>%
+  distinct(subj) %>%
+  rowwise() %>%
+  mutate(subid = str_split(subj, "_", simplify = T)[1]) %>%
+  ungroup() %>%
+  mutate(subid = paste0("callab_", subid)) %>%
+  mutate(lab = "callab")
+
+mb_data <- gaze_data %>%
   filter(type == "Trial") %>%
-  group_by(speechType, subj, trial) %>%
-  summarise(duration = mean(duration)) %>%
-  summarise(duration = mean(duration)) %>%
-  spread(speechType, duration) %>%
-  mutate(diff = IDS - ADS) %>%
-  summarise_at(vars(diff), funs(mean, sem), na.rm = T) %>%
-  datatable(rownames = FALSE)
+  group_by(subj, speechType, trial, stimNum) %>%
+  arrange(time) %>%
+  mutate(diff_time = time - lag(time),
+         looking_time = diff_time * (status != 22)) %>%
+  summarise(total_trial_time = sum(diff_time, na.rm = T), 
+            looking_time = sum(looking_time, na.rm = T)) %>%
+  left_join(subjs) %>%
+  ungroup() %>%
+  mutate(stimulus = if_else(speechType == "training", "training",
+                            paste0(speechType, stimNum)),
+         trial_num = if_else(stimulus == "training", trial-3, trial -2),
+         trial_error = "noerror",
+         trial_error_type = NA,
+         notes = NA) %>%
+  rename(trial_type = speechType) %>%
+  select(lab, subid, trial_type, stimulus, trial_num, looking_time, total_trial_time,
+         trial_error, trial_error_type, notes) %>%
+  arrange(subid, trial_num)
+
+write_csv(mb_data, "callab_older.csv")
+
+mb_data %>%
+  filter(looking_time > 0) %>%
+  group_by(trial_type, subid) %>%
+  summarise(looking_time = mean(looking_time)) %>%
+  summarise(mean = mean(looking_time), sem = sem(looking_time))
+
+mb_data %>%
+  bind_rows(read_csv("callab_younger.csv")) %>%
+  write_csv("callab_manybabies.csv")
+
+subjs %>%
+  rowwise() %>%
+  mutate(subj = str_split(subj, "[_.]", simplify = T)[4:6] %>% paste0(collapse = "_")) %>%
+  select(-lab) %>%
+  mutate(group = "younger") %>%
+  bind_rows(read_csv("older_subjs.csv")) %>%
+  write_csv("subjs.csv")
 
 
 ```
 
-```{r plots, fig.width = 5, fig.height = 12}
+```{r plots, fig.width = 5, fig.height = 12, eval = F, include = F}
 make_plots <- function(gaze_data) {
   
   print(paste0("Subj: ", gaze_data[1,"subj"]))
@@ -189,6 +282,7 @@ make_plots <- function(gaze_data) {
 }
 
 gaze_data %>%
+  filter(subj == unique(gaze_data$subj)[8]) %>%
   split(.$subj) %>%
   walk(., make_plots)
 ```
