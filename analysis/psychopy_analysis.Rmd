@@ -49,16 +49,10 @@ et_files_older <- list.files(here("data/older"), "*.hdf5",
                              full.names = TRUE)
 
 log_files_older <- list.files(here("data/older"), "*.log", 
-                                full.names = TRUE) %>%
-  enframe(name = NULL) %>%
-  filter(!str_detect(value, "33") & !str_detect(value, "38") ) %>%
-  pull(value)
+                                full.names = TRUE)
 
 trial_files_older <- list.files(here("data/older"), "*.csv", 
-                                  full.names = TRUE) %>%
-  enframe(name = NULL) %>%
-  filter(!str_detect(value, "33") & !str_detect(value, "38") ) %>%
-  pull(value)
+                                  full.names = TRUE) 
 ```
 
 ```{r loading-helpers}
